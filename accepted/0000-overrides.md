@@ -34,7 +34,7 @@ Add a field to `package.json` called `overrides`, with the following shape:
 ```json
 {
   "overrides": {
-    "<selection package specifier>": "<result package specifier or overrides set>"
+    "<selection specifier>": "<result specifier or overrides set>"
   }
 }
 ```
@@ -44,18 +44,37 @@ specifier without a name, _or_ a nested overrides object.  Nested override
 objects apply to dependency resolutions within the portion of the
 dependency graph indicated by the key.
 
-### No Cascading Overrides
-
 The `overrides` key will only be considered when it is in the root
 `package.json` file for a project.  `overrides` in installed dependencies
-will _not_ be considered in dependency tree resolution.
+will _not_ be considered in dependency tree resolution.  Thus, there is no
+cascading overrides between multiple different `package.json` files at any
+given time.
 
-`overrides` are not applied to overridden resolutions.  That is, if the
-result of an override results in a package specifier that _would_ be
-subject to an override at that level or higher, the second override is not
-applied.  This prevents infinite regresses and loops, and greatly
-simplifies the feature both from an implementation and user experience
-point of view.
+### String Overrides
+
+When the value of an override rule is a string, it is a replacement
+resolution target for resolutions matching the key.  String values _must_
+be a dependency specifier without a name.  (Aliases are supported using the
+`npm:` alias specifier.)
+
+String overrides within a given overrides object are applied in definition
+order, stopping at the _first_ rule to match.  For example:
+
+```js
+{
+  "overrides": {
+    "y@1": "1.2.3",
+    "y@1.2.3": "2.3.4" // <-- this will never match anything
+  }
+}
+```
+
+In this case, the `y@1.2.3 -> 2.3.4` rule will never be applied, because
+any `y@1` dependency will be written to `1.2.3`, and stop evaluating string
+override rules.
+
+This prevents infinite regresses and loops, and greatly simplifies the
+feature both from an implementation and user experience point of view.
 
 For example:
 
@@ -73,11 +92,10 @@ In this case, a package that depends on `foo@1.0.0` will instead be given
 `foo@2.0.0`.  A package that depends on `foo@2.0.0` will instead be given
 `foo@3.0.0`.  What it will _not_ do is apply the `foo@1.0.0` override to
 `foo@2.0.0`, and then consider whether any other overrides apply to it, and
-so on.  (In this case, it would create an infinite regress, which is no
-good.)
+so on.  (In this case, it would create an infinite regress.)
 
 A more realistic and less contrived case where a cascade could be
-desireable would be something like this:
+desirable would be something like this:
 
 ```json
 {
@@ -92,11 +110,11 @@ In this case, we are saying that any `webpack@1` dependencies should be
 bumped up to `webpack@2`, and furthermore, that any `webpack@2`
 dependencies should be pinned to `webpack@2.7.0`.
 
-In practice, since rules are applied once and not stacked or cascaded, any
-webpack dependency that would resolve to a version matched by `2.x` will be
-overridden to `2.7.0`.  But, any dependency that resolves to a version
-matched by `1.x` will be set to whichever version happens to be the latest
-`2.x` at the time of installation.
+In practice, since string-value rules are applied once and not stacked or
+cascaded, any webpack dependency that would resolve to a version matched by
+`2.x` will be overridden to `2.7.0`.  But, any dependency that resolves to
+a version matched by `1.x` will be set to whichever version happens to be
+the latest `2.x` at the time of installation.
 
 In order to produce the intended behavior described, the user would have to
 either specify it twice:
@@ -119,6 +137,56 @@ Or make the dependency matching range wider:
   }
 }
 ```
+
+### Object Overrides
+
+An object value in an overrides object defines a _child rule set_.
+
+After all string overrides for a given package are applied, all matching
+override rules with object values are merged together in definition order,
+for use throughout the specified branch of the dependency graph.  Child
+override rulesets are applied _ahead of_ the parent override rules.
+
+For example:
+
+```json
+{
+  "typescript@^3.8": "3.7",
+  "react": "15",
+  "react@15": {
+    "loose-envify@1": "1.3.1"
+  },
+  "tap": {
+    "react": "16.13.1"
+  }
+}
+```
+
+When resolving `react` at the root level of the tree, any given version
+will be overridden to resolve `15` instead.  Then, as it will match
+`react@15` object, any version of `react@15` will get `loose-envify@1.3.1`
+as a dependency instead of pulling the latest `^1.1.0` as it would by
+default.
+
+Within the `tap` branch of the dependency graph, `react` will be set to
+`16.13.1`.
+
+Within the entire tree (including the `react` and `tap` branches),
+`typescript@^3.8` dependencies will be overridden to the latest `3.7.x`
+version.
+
+The _effective override ruleset_ for any given dependency is determined
+thusly:
+
+- If resolving dependencies for the root node, use the `overrides` from
+  `package.json`.
+- After applying string-value override rules for a given dependency, find
+  the set of object-value override rules where the depenedency matches the
+  selection specifier.
+- If no such child rule sets are found, the child inherits the parent's
+  override rule set.
+- Else, merge all override rule sets in definition order, followed by the
+  parent rule set.
 
 ### Examples
 
@@ -196,6 +264,84 @@ dependency of `foo` when `foo` is a dependency of `bar`:
 }
 ```
 
+### Combining Overrides
+
+This algorithm gives rise to the following behaviors and edge cases when
+applying rules throughout the dependency resolution process.
+
+#### Multiple String Value Overrides
+
+A deliberately extreme example:
+
+```js
+{
+  "overrides": {
+    "y@1": "1.2.3",
+    "y@1.2": "1.2.4",       // not relevant
+    "y@1.2.x": "1.2.5",     // not relevant
+    "y@>1.2 <1.3": "1.2.6", // not relevant
+    "y@1.2.6": "1.2.3"      // not relevant
+  }
+}
+```
+
+In this case, all the rules after the first are irrelevant, because only
+the _first_ rule to match will have any effect.
+
+#### Swapping
+
+It is possible to "swap" versions, but this will not cause an infinite
+regress, because only the first string-value rule will be applied.
+
+```json
+{
+  "overrides": {
+    "y@1": "2",
+    "y@2": "1"
+  }
+}
+```
+
+In this case, any version matching `y@1` will be overridden to `y@2`.  Any
+version initially matching `y@2` will be overridden to `y@1`.  Because
+rules do not stack, there is no infinite regress.
+
+#### Combining String Value Overrides with Object Value Overrides
+
+There are cases where it may be desirable to lock a version of a given
+package down to a specific version within the tree, _and_ override the
+version of one of its dependencies.
+
+For example:
+
+```json
+{
+  "y": "1.2.3",
+  "y@1": {
+    "x": "1.2.3"
+  }
+}
+```
+
+#### Inheriting String Value Overrides Within Child Object Overrides
+
+When a string value override rule is defined at the top level, it is
+inherited by child override rule sets.
+
+For example, consider that `y` depends on both `x` and `z`.
+
+```json
+{
+  "y": {
+    "z": "1.2.3"
+  },
+  "x": "1.2.3"
+}
+```
+
+Within the `y` branch of the dependency graph, `x` will be overridden to
+`x@1.2.3` and `z` will be overridden to `z@1.2.3`.
+
 ## Prior Art and Alternatives
 
 * [Yarn Selective Dependency
@@ -255,26 +401,50 @@ Three new fields are added to the `Node` object:
   one by its dependency relationship.
 - `overridesRelevant` A boolean set initially to `false`, indicating that
   the overrides on this node were relevant in this branch of the dependency
-  graph.
+  graph.  (That is, a string-value override rule was applied.)
+
+One new field added to the `Edge` object:
+
+- `overridden` Boolean initially set to `false`, indicating that the edge
+  was replaced by an overridden dependency.
+
+One new field added to the `Arborist` object:
+
+- `overridesRuleSets` Map object used to identify duplicate rule sets.
 
 To flag a node's override as relevant:
 
 - Set `node.overridesRelevant = true`.
 - Flag `node.overridesProvider`'s overrides as relevant.
 
+
+
+XXX is setting it on overridesProvider enough?  If a node is deduped, then
+its "relevance" may be connected to more than one "provider".  Really, we
+have to say that the overrides _ruleset_ (and its parent) were relevant,
+not just that the node itself had a relevant override.
+
+
+
+
 If any overrides exist on a given node, then:
 
-- When resolving any given dependency, if it is not already subject to an
-  override, test the resulting `resolved` value against the set of
-  `override` keys.
-- If there is a match, then:
-    - If the value is a string, then replace the `Edge` object with a new
-      edge representing the new spec, and re-resolve.  (Subsequent override
-      matches will be ignored.)  Flag this node as having relevant
-      overrides.
-    - If the value is an object, then attach the value to the resulting
-      dependency as `dep.overrides` and set `dep.overridesProvider` to the
-      node with the dependency.
+- When resolving any given dependency, if the edge is not already
+  overridden, test the resulting node against the set of `override` keys.
+- Find the first string-value overrides rule found.
+    - Replace the `Edge` object with a new
+      edge representing the new spec, and mark it as overridden.
+      (Subsequent string-value override matches will be ignored.)  Flag
+      this node as having relevant overrides.
+- Calculate the effective overrides rules for the node.
+    - Merge together all matching object-value overrides rules, followed by
+      the parent's override rule set.
+    - Let `overridesRuleSetKey` be the JSON representation of the resulting
+      object.
+    - If `overridesRuleSetKey` is in `overridesRuleSets`, then use
+      the value stored.
+    - If not, store the rule set in `overridesRuleSets`.
+    - Set `dep.overrides` to the resulting rule set object.
 - If there is no match, then:
     - the `overrides` object is attached to the dep node.
     - the `overridesProvider` is set as a reference to the node with the
